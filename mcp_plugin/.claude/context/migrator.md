@@ -90,6 +90,34 @@ installs it is in [setup.md](setup.md).
     This is also why an earlier manual `plan` run printed "Aborted." rather than hanging.
   - **`--non-interactive` is passed to `run` and `resume` ONLY.** Passing it to `plan`
     would break the invocation.
+  - **The load-failure gate: every invocation sends `MIGRATOR_BLOCK_ON_LOAD_FAILURES=1`**
+    (`BLOCK_ON_LOAD_FAILURES_ENV`, set in `_run_orchestrator` beside `VIRTUAL_ENV`). Why: the
+    plugin is always non-interactive (stdin is `/dev/null`), and a non-interactive
+    orchestrator logs load failures and CONTINUES unless this is `1`. The variable is
+    merged from `os.environ` OVER the YAML `env:` block in `migrationctl.py`, so a value in
+    the configuration cannot undo it. `run` and `resume` share the code path, so one change
+    covers both. The surface is documented in `docs/INTEGRATION.md` of the
+    Mysql-to-MariaDB-Migration repo, which says MCP consumers should set it on every
+    invocation, present the findings as a decision, and re-invoke without it once accepted.
+    - **A stop is a PRECHECK RESULT, not a tool error.** The gate exits 1 after printing
+      `Stopping: MIGRATOR_BLOCK_ON_LOAD_FAILURES=1 ...`; `_run_orchestrator` then adds a
+      `load_failures` object to the outcome (`_load_failure_decision`):
+      `decision_required: true`, the `findings`, `if_user_accepts`, `if_user_declines`.
+      `succeeded` stays false. Other failures (a failed step is exit 3) carry no such key.
+    - **`accept_load_failures` on `migrator.run` and `migrator.resume`** (default false) is
+      the documented way to proceed. When true the variable is sent as **`"0"`, not left
+      unset**, so the YAML cannot turn the gate back on. The tool text tells the model to
+      ask the user first.
+    - **`resume` re-gates**: the gate also fires on a precheck step that is already DONE, so
+      a resume WITHOUT `accept_load_failures` stops at the same place. Accept via `resume`
+      with the same `out` to keep the finished steps.
+    - **Detection and findings are SCRAPED from stdout**: the literal
+      `Stopping: MIGRATOR_BLOCK_ON_LOAD_FAILURES=1` and the lines of the `LOAD FAILURES:`
+      block up to `Detail:`. That ties the plugin to the orchestrator's wording; see Next
+      steps for the structured replacement.
+    - **The gate exists from tooling 1.6.0, NOT in v1.5.0**, so with the pin on v1.5.0 the
+      variable is ignored. The pin must go straight to `v1.6.0`, never to a milestone tag,
+      before this ships.
   - **The child gets `cwd=install_dir` plus `VIRTUAL_ENV` and a prepended `<venv>/bin` on
     PATH** — what `activate` does, without a shell. `PYTHONHOME` is popped. So the
     orchestrator and anything it shells out to resolve `python3` inside the venv. `out`
@@ -227,7 +255,7 @@ installs it is in [setup.md](setup.md).
   - `remove()` removes the wrapper FIRST, then the tree: a wrapper pointing at a deleted
     install is worse than none.
   Decisions inherited from the original AIPL-21 commit, still standing:
-  - **The release is PINNED** as `general.MIGRATOR_VERSION` (currently `v1.5.0`), not
+  - **The release is PINNED** as `general.MIGRATOR_VERSION` (`lib/general.py`), not
     tracked from main: what an install contains is then a property of the plugin version and
     not of the day it was set up, and a release that breaks something is answered by pinning
     the one before it. There is deliberately NO update step — a different release means
@@ -245,9 +273,8 @@ installs it is in [setup.md](setup.md).
   - **The new copy is staged beside the old one and swapped in only once complete**, so a
     failed download leaves an installed copy exactly as it was — and a failed SWAP puts the
     old copy back. Both directions are pinned by tests.
-  - The installed release is recorded in `.migrator-version` (`MIGRATOR_VERSION_FILE`) and
-    read back by `installed_migrator_version()`; a copy without it reports "unknown
-    version", and a mismatch with the configured release is called out in the menu.
+  - A mismatch between an installed release's directory name and the configured release is
+    called out in the menu.
   - Download and removal failures are REPORTED, not raised, out of `_manage_migrator` — the
     setup menu must survive a network problem. `MIGRATOR_DOWNLOAD_TIMEOUT` is 120s.
 
@@ -262,7 +289,9 @@ installs it is in [setup.md](setup.md).
   Raises `ToolError` throughout and imports NO `mysqlsh`; registers with plain
   `server.tool`. **100% covered — keep it that way.**
 
-- tests/unit/test_migrator_tools.py -> the 30 migrator-tool tests. The orchestrator is
+- tests/unit/test_migrator_tools.py -> the migrator-tool tests, including the gate: the
+  variable is `1` in the child env, a gate stop yields the `load_failures` decision,
+  `accept_load_failures` sends `0`, and a non-gate failure has no decision. The orchestrator is
   NEVER run: `recorded_run` stubs `subprocess.run` and the assertions are on the command,
   cwd, env and stdin. `fake_install` builds a stand-in install (config/, the example, a
   stub venv python); `configured_connections` PATCHES `config.resolve_connection_uri`,
@@ -375,6 +404,17 @@ installs it is in [setup.md](setup.md).
   disagree with the path.
 
 ## Next steps
+
+0. **Load-failure gate follow-ups.**
+   - Move off scraping: check whether `_write_load_failure_artifacts` (`migrationctl.py`)
+     runs on the gate path and whether the findings reach `report.json`; then read the
+     findings from there and key detection on the exit code instead of the literal stdout
+     string.
+   - Move the pin to `v1.6.0` (see Architecture); the gate is absent from v1.5.0.
+   - The gate tests have not been run: they need `run_tests.py --only=migrator_tools` on a
+     shell new enough to have `mysqlsh.task_manager`.
+   - Document `accept_load_failures` and the `load_failures` result in the
+     `mariadb-migrator-run` skill.
 
 3. **Write the SKILL for authoring `config/migration.yaml`.** The user said this is coming
    ("We will write a skill covering how to write that later") and it is the one piece of

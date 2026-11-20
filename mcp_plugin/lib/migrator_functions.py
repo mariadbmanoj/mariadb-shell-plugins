@@ -82,6 +82,16 @@ ORCHESTRATOR_MODULE = "orchestrator.migrationctl"
 # artifacts directory: the run's own report and log can be read from there.
 DEFAULT_COMMAND_TIMEOUT = 3600
 
+# The orchestrator's load-failure gate. Without a terminal it logs the findings
+# and CONTINUES unless this is "1" (migrator docs/INTEGRATION.md: MCP and AI-skill
+# consumers should set it on every invocation and present the findings as a
+# decision). Set in the child's real environment, which the orchestrator merges
+# over the YAML env block, so a value in the configuration cannot undo it.
+BLOCK_ON_LOAD_FAILURES_ENV = "MIGRATOR_BLOCK_ON_LOAD_FAILURES"
+
+# What the orchestrator prints when that gate stops a run (exit code 1).
+_GATE_STOP_MARKER = f"Stopping: {BLOCK_ON_LOAD_FAILURES_ENV}=1"
+
 # How much of the orchestrator's output to hand back. Enough to see what it did
 # and why it stopped, bounded so a chatty run cannot flood a client's context.
 OUTPUT_TAIL_LIMIT = 8000
@@ -397,7 +407,9 @@ def _tail(text: str) -> str:
     return "... (truncated)\n" + text[-OUTPUT_TAIL_LIMIT:]
 
 
-def _run_orchestrator(command: str, arguments: list, timeout: int) -> dict:
+def _run_orchestrator(
+    command: str, arguments: list, timeout: int, accept_load_failures: bool = False
+) -> dict:
     """Runs one orchestrator subcommand in the install directory.
 
     The child is given the install directory as its working directory and the
@@ -410,6 +422,10 @@ def _run_orchestrator(command: str, arguments: list, timeout: int) -> dict:
         command (str): The subcommand to run.
         arguments (list): Its arguments.
         timeout (int): Seconds to allow before giving up.
+        accept_load_failures (bool): True when the user has decided to proceed
+            despite the source's load failures. The gate variable is then sent
+            as "0" rather than left unset, so the YAML env block cannot turn
+            it back on.
 
     Returns:
         A dict describing the invocation's outcome.
@@ -433,6 +449,7 @@ def _run_orchestrator(command: str, arguments: list, timeout: int) -> dict:
     child_env.update(passwords)
     # What `activate` does, without needing a shell to do it.
     child_env["VIRTUAL_ENV"] = venv_dir
+    child_env[BLOCK_ON_LOAD_FAILURES_ENV] = "0" if accept_load_failures else "1"
     child_env["PATH"] = os.path.join(venv_dir, "bin") + os.pathsep + child_env.get(
         "PATH", ""
     )
@@ -468,7 +485,7 @@ def _run_orchestrator(command: str, arguments: list, timeout: int) -> dict:
             "then."
         ) from error
 
-    return {
+    outcome = {
         "command": command,
         "succeeded": result.returncode == 0,
         "exit_code": result.returncode,
@@ -477,6 +494,59 @@ def _run_orchestrator(command: str, arguments: list, timeout: int) -> dict:
         "passwords_from": resolved,
         "stdout": _tail(result.stdout),
         "stderr": _tail(result.stderr),
+    }
+    if result.returncode != 0 and _GATE_STOP_MARKER in (result.stdout or ""):
+        outcome["load_failures"] = _load_failure_decision(command, result.stdout)
+
+    return outcome
+
+
+def _load_failure_decision(command: str, stdout: str) -> dict:
+    """Describes a run stopped by the load-failure gate as a decision.
+
+    The stop is a precheck result, not a tool error: nothing was wrong with the
+    invocation, the orchestrator found objects the target will reject and is
+    waiting to be told whether to go on. ``resume`` can stop here too, because
+    the gate fires again on a resumed precheck.
+
+    Args:
+        command (str): The subcommand that was stopped.
+        stdout (str): Its standard output.
+
+    Returns:
+        A dict with the findings and how to re-run accepting them.
+    """
+    findings = []
+    in_block = False
+    for line in stdout.splitlines():
+        if line.startswith("LOAD FAILURES:"):
+            in_block = True
+            continue
+        if in_block:
+            if line.strip().startswith("Detail:"):
+                break
+            if line.strip():
+                findings.append(line.strip())
+
+    return {
+        "decision_required": True,
+        "summary": (
+            "The run was stopped before moving any data: the source has "
+            "objects the target will reject. This is the user's decision, not "
+            "an error - present the findings and ask whether to fix them on "
+            "the source or proceed anyway."
+        ),
+        "findings": findings,
+        "if_user_accepts": (
+            "Re-run with accept_load_failures=true. Use migrator.resume with "
+            "the same 'out' to keep the steps already done (the gate fires "
+            "again on resume, so a resume without it stops here too). The "
+            "failing objects will then fail to load."
+        ),
+        "if_user_declines": (
+            "Fix the findings on the source, then start a new migrator.run. "
+            "The full report is in the assess/precheck output under out_dir."
+        ),
     }
 
 
@@ -654,6 +724,7 @@ def register_migrator_tools(server, function_groups=()) -> None:
         mode: str,
         out: Optional[str] = None,
         timeout: int = DEFAULT_COMMAND_TIMEOUT,
+        accept_load_failures: bool = False,
     ) -> dict:
         """Executes the migration steps for the configured source and target.
 
@@ -671,13 +742,19 @@ def register_migrator_tools(server, function_groups=()) -> None:
                 artifacts directory is returned either way, so a run that
                 outlasts its timeout can still be followed from its own files
                 and picked up with migrator.resume.
+            accept_load_failures: Leave false. When a run comes back with
+                load_failures.decision_required, ask the user; only if they
+                accept the listed failures call again with true.
 
         Returns:
             A dict with the outcome, the artifacts directory and the run's own
             report.json when it wrote one.
         """
         return await anyio.to_thread.run_sync(
-            lambda: _invoke("run", mode, out, timeout, non_interactive=True)
+            lambda: _invoke(
+                "run", mode, out, timeout, non_interactive=True,
+                accept_load_failures=accept_load_failures,
+            )
         )
 
     @tool(name="migrator.resume")
@@ -686,6 +763,7 @@ def register_migrator_tools(server, function_groups=()) -> None:
         mode: str,
         out: str,
         timeout: int = DEFAULT_COMMAND_TIMEOUT,
+        accept_load_failures: bool = False,
     ) -> dict:
         """Resumes a failed migration from the state.json of an earlier run.
 
@@ -695,6 +773,9 @@ def register_migrator_tools(server, function_groups=()) -> None:
                 install directory - the one holding its state.json, as returned
                 by migrator.run.
             timeout: Seconds to allow before the invocation is stopped.
+            accept_load_failures: Leave false. When a run comes back with
+                load_failures.decision_required, ask the user; only if they
+                accept the listed failures call again with true.
 
         Returns:
             A dict with the outcome, the artifacts directory and the run's own
@@ -706,12 +787,20 @@ def register_migrator_tools(server, function_groups=()) -> None:
             )
 
         return await anyio.to_thread.run_sync(
-            lambda: _invoke("resume", mode, out, timeout, non_interactive=True)
+            lambda: _invoke(
+                "resume", mode, out, timeout, non_interactive=True,
+                accept_load_failures=accept_load_failures,
+            )
         )
 
 
 def _invoke(
-    command: str, mode: str, out: Optional[str], timeout: int, non_interactive: bool
+    command: str,
+    mode: str,
+    out: Optional[str],
+    timeout: int,
+    non_interactive: bool,
+    accept_load_failures: bool = False,
 ) -> dict:
     """Builds one orchestrator invocation's arguments and runs it.
 
@@ -723,6 +812,8 @@ def _invoke(
         non_interactive (bool): Whether the subcommand takes
             ``--non-interactive``. ``plan`` does not, which is why every
             invocation also gets a closed stdin.
+        accept_load_failures (bool): Whether the user accepted the source's
+            load failures, which lets the run go past the gate.
 
     Returns:
         The outcome dict, with the artifacts directory and report added.
@@ -747,7 +838,7 @@ def _invoke(
     if non_interactive:
         arguments.append("--non-interactive")
 
-    outcome = _run_orchestrator(command, arguments, timeout)
+    outcome = _run_orchestrator(command, arguments, timeout, accept_load_failures)
     outcome["mode"] = mode
     outcome["out_dir"] = out_dir
     outcome["report"] = _read_report(outcome["install_dir"], out_dir)

@@ -480,6 +480,8 @@ def test_the_invocation_runs_in_the_install_with_the_venv_interpreter(
     assert child_env["VIRTUAL_ENV"] == venv_dir
     assert child_env["PATH"].startswith(os.path.join(venv_dir, "bin") + os.pathsep)
     assert "PYTHONHOME" not in child_env
+    # The gate stops a non-interactive run instead of continuing through it.
+    assert child_env["MIGRATOR_BLOCK_ON_LOAD_FAILURES"] == "1"
     # The passwords reach the orchestrator through the environment ...
     assert child_env["SRC_ADMIN_PASS"] == "src-secret"
     assert child_env["TGT_ADMIN_PASS"] == "tgt-secret"
@@ -508,6 +510,77 @@ def test_only_the_subcommands_that_take_non_interactive_are_given_it(
 
     migrator_functions._invoke("resume", "one_step", "artifacts/earlier", 60, True)
     assert "--non-interactive" in recorded_run[-1][0]
+
+
+_GATE_STDOUT = (
+    "LOAD FAILURES: 2 object(s) the target will reject.\n\n"
+    "  VIEW               shop.v1  (view, error 1064)\n"
+    "  TRIGGER            shop.t1  (trigger, error 1064)\n\n"
+    "  Detail: /x/precheck/load_failures.tsv\n\n"
+    "Stopping: MIGRATOR_BLOCK_ON_LOAD_FAILURES=1 and the source has load failures.\n"
+)
+
+
+@pytest.fixture
+def gate_stopped_run(monkeypatch):
+    """Makes the orchestrator exit 1 at the load-failure gate."""
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 1, stdout=_GATE_STDOUT, stderr="")
+
+    monkeypatch.setattr(migrator_functions.subprocess, "run", fake_run)
+    yield calls
+
+
+def test_a_gate_stop_is_presented_as_a_decision_for_the_user(
+    fake_install, configured_connections, gate_stopped_run
+):
+    """Exit 1 at the gate is a precheck result: findings plus how to accept."""
+    _write_valid_config()
+
+    outcome = migrator_functions._invoke("run", "one_step", None, 60, True)
+
+    assert outcome["succeeded"] is False
+    decision = outcome["load_failures"]
+    assert decision["decision_required"] is True
+    assert decision["findings"] == [
+        "VIEW               shop.v1  (view, error 1064)",
+        "TRIGGER            shop.t1  (trigger, error 1064)",
+    ]
+    assert "accept_load_failures=true" in decision["if_user_accepts"]
+    assert "migrator.resume" in decision["if_user_accepts"]
+
+
+def test_accepting_load_failures_sends_the_gate_variable_as_zero(
+    fake_install, configured_connections, recorded_run
+):
+    """Explicit "0", not unset, so the YAML env block cannot re-enable it."""
+    _write_valid_config()
+
+    migrator_functions._invoke(
+        "resume", "one_step", "artifacts/earlier", 60, True,
+        accept_load_failures=True,
+    )
+
+    assert recorded_run[-1][1]["env"]["MIGRATOR_BLOCK_ON_LOAD_FAILURES"] == "0"
+
+
+def test_other_failures_carry_no_load_failure_decision(
+    fake_install, configured_connections, monkeypatch
+):
+    """A step failure (exit 3) is not mistaken for the gate."""
+    monkeypatch.setattr(
+        migrator_functions.subprocess, "run",
+        lambda command, **kw: subprocess.CompletedProcess(
+            command, 3, stdout="RUN: FAIL at load\n", stderr=""),
+    )
+    _write_valid_config()
+
+    outcome = migrator_functions._invoke("run", "one_step", None, 60, True)
+
+    assert "load_failures" not in outcome
 
 
 def test_the_artifacts_directory_defaults_to_a_fresh_stamped_one(
